@@ -1,0 +1,29 @@
+{
+  "name": "jarvis-desktop",
+  "productName": "Jarvis",
+  "version": "0.1.0-beta.2",
+  "description": "A voice and text desktop assistant for Windows, powered by ChatGPT sign-in through Codex.",
+  "main": "src/main.js",
+  "author": "Jarvis contributors",
+  "license": "MIT",
+  "scripts": {
+    "prepare:electron": "node node_modules/electron/install.js",
+    "start": "npm run prepare:electron && electron .",
+    "package": "npm run prepare:electron && electron-forge package --platform win32 --arch x64",
+    "make": "npm run prepare:electron && node scripts/make.js"
+  },
+  "dependencies": {
+    "@openai/codex": "^0.156.1"
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "8.0.0-alpha.10",
+    "@electron-forge/maker-squirrel": "8.0.0-alpha.10",
+    "electron": "^44.4.5"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "config": {
+    "forge": "./forge.config.cjs"
+  }
+}
