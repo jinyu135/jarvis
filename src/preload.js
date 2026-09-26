@@ -3,6 +3,10 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('jarvis', {
   getState: () => ipcRenderer.invoke('jarvis:get-state'),
   sendMessage: (text) => ipcRenderer.invoke('jarvis:send-message', text),
+  stopTurn: () => ipcRenderer.invoke('jarvis:stop-turn'),
+  newConversation: () => ipcRenderer.invoke('jarvis:new-conversation'),
+  listConversations: () => ipcRenderer.invoke('jarvis:list-conversations'),
+  openConversation: (threadId) => ipcRenderer.invoke('jarvis:open-conversation', threadId),
   signIn: () => ipcRenderer.invoke('jarvis:sign-in'),
   signOut: () => ipcRenderer.invoke('jarvis:sign-out'),
   respondToApproval: (choice) => ipcRenderer.invoke('jarvis:respond-approval', choice),

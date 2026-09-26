@@ -8,6 +8,9 @@ const readline = require('node:readline');
 const SCRIPT = path.join(__dirname, 'desktop.ps1');
 const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 const TOOL_TIMEOUT_MS = 80000;
+const APPROVAL_TIMEOUT_MS = 75000;
+let nextElicitationId = 1;
+const pendingElicitations = new Map();
 
 const objectSchema = (properties = {}, required = []) => ({
   type: 'object',
@@ -80,6 +83,80 @@ const TOOLS = [
       limit: { type: 'integer', minimum: 1, maximum: 50, description: 'Maximum number of processes, default 10.' },
       backgroundOnly: { type: 'boolean', description: 'Only processes without a main window, default false.' }
     })
+  },
+  {
+    name: 'desktop_search_files',
+    description: 'Search files on demand inside one requested folder. Defaults to the current user profile. Never search a drive root or scan the whole disk. Skips directory links and stops after the result/scan limit.',
+    inputSchema: objectSchema({
+      rootPath: string('The specific folder named by the user. Defaults to the current Windows user profile.'),
+      namePattern: string('A file name or wildcard pattern such as *.pdf. Do not include folder separators.'),
+      limit: { type: 'integer', minimum: 1, maximum: 100, description: 'Maximum matching files to return, default 30.' }
+    })
+  },
+  {
+    name: 'desktop_get_file_info',
+    description: 'Read basic metadata for one exact file or folder path. Does not read file contents.',
+    inputSchema: objectSchema({ path: string('Exact existing file or folder path.') }, ['path'])
+  },
+  {
+    name: 'desktop_copy_file',
+    description: 'Copy one file to an exact destination path. Refuses to overwrite any existing file.',
+    inputSchema: objectSchema({
+      sourcePath: string('Exact existing source file path.'),
+      destinationPath: string('Exact destination file path, including its new file name. It must not already exist.')
+    }, ['sourcePath', 'destinationPath'])
+  },
+  {
+    name: 'desktop_move_file',
+    description: 'Move one file to an exact destination path. Refuses to overwrite any existing file.',
+    inputSchema: objectSchema({
+      sourcePath: string('Exact existing source file path.'),
+      destinationPath: string('Exact destination file path, including its new file name. It must not already exist.')
+    }, ['sourcePath', 'destinationPath'])
+  },
+  {
+    name: 'desktop_rename_file',
+    description: 'Rename one file in its current folder. The new name must be a single file name and must not already exist.',
+    inputSchema: objectSchema({
+      path: string('Exact existing file path.'),
+      newName: string('New file name only, with no path separators.')
+    }, ['path', 'newName'])
+  },
+  {
+    name: 'desktop_recycle_file',
+    description: 'Move one exact file or folder to the Windows Recycle Bin. This tool has a per-call user approval prompt. Permanent deletion is not available.',
+    inputSchema: objectSchema({ path: string('Exact existing file or folder path to place in the Recycle Bin.') }, ['path'])
+  },
+  {
+    name: 'desktop_launch_app',
+    description: 'Launch one already-installed Windows application executable by its exact path. Does not accept command-line arguments. Do not launch installers; ask for approval first using confirm_high_impact.',
+    inputSchema: objectSchema({ path: string('Exact path to an installed .exe application.') }, ['path'])
+  },
+  {
+    name: 'desktop_focus_window',
+    description: 'Bring a visible window to the foreground using the exact handle returned by desktop_list_windows.',
+    inputSchema: objectSchema({ handle: string('Exact window handle returned by desktop_list_windows.') }, ['handle'])
+  },
+  {
+    name: 'desktop_system_resources',
+    description: 'Show a current snapshot of processor load, memory, and fixed-drive capacity.',
+    inputSchema: objectSchema()
+  },
+  {
+    name: 'desktop_list_processes',
+    description: 'List running processes sorted by physical memory use, optionally filtered by a process name substring.',
+    inputSchema: objectSchema({
+      limit: { type: 'integer', minimum: 1, maximum: 100, description: 'Maximum processes to return, default 30.' },
+      nameContains: string('Optional process name substring filter.')
+    })
+  },
+  {
+    name: 'desktop_terminate_process',
+    description: 'Terminate one process by PID and exact process name. A per-call user approval prompt is required before it runs.',
+    inputSchema: objectSchema({
+      processId: integer('Exact process ID from a fresh desktop_list_processes result.'),
+      processName: string('Exact process name from that same result, without an .exe suffix.')
+    }, ['processId', 'processName'])
   },
   {
     name: 'confirm_high_impact',
@@ -174,11 +251,31 @@ function textResult(value) {
   return { content: [{ type: 'text', text: JSON.stringify(value) }] };
 }
 
-async function callTool(name, rawArgs) {
+function requestUserApproval(message) {
+  const id = `jarvis-approval-${nextElicitationId++}`;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingElicitations.delete(id);
+      reject(new Error('사용자 승인 대기 시간이 지났습니다. 작업은 실행하지 않았습니다.'));
+    }, APPROVAL_TIMEOUT_MS);
+    pendingElicitations.set(id, (response) => {
+      clearTimeout(timer);
+      if (response?.error) reject(new Error(response.error.message || '승인 응답을 받지 못했습니다.'));
+      else resolve(response?.result);
+    });
+    send({ id, method: 'elicitation/create', params: {
+      mode: 'form',
+      message,
+      requestedSchema: { type: 'object', properties: {} }
+    } });
+  });
+}
+
+async function callTool(name, rawArgs, desktopRunner = runDesktop, approvalRequester = requestUserApproval) {
   const args = requiredObject(rawArgs);
   switch (name) {
     case 'desktop_screenshot': {
-      const image = await runDesktop('screenshot');
+      const image = await desktopRunner('screenshot');
       if (typeof image.data !== 'string' || !image.data) throw new Error('Screenshot data was missing');
       return { content: [
         { type: 'text', text: JSON.stringify({
@@ -190,27 +287,27 @@ async function callTool(name, rawArgs) {
       ] };
     }
     case 'desktop_list_windows':
-      return textResult(await runDesktop('list_windows'));
+      return textResult(await desktopRunner('list_windows'));
     case 'desktop_click': {
       const x = coordinate(args.x, 'x');
       const y = coordinate(args.y, 'y');
       const button = args.button === undefined ? 'left' : args.button;
       if (!['left', 'right', 'middle'].includes(button)) invalid('button must be left, right, or middle');
-      return textResult(await runDesktop('click', { x, y, button, count: 1 }));
+      return textResult(await desktopRunner('click', { x, y, button, count: 1 }));
     }
     case 'desktop_double_click':
-      return textResult(await runDesktop('click', {
+      return textResult(await desktopRunner('click', {
         x: coordinate(args.x, 'x'), y: coordinate(args.y, 'y'), button: 'left', count: 2
       }));
     case 'desktop_type_text':
       if (typeof args.text !== 'string' || args.text.length > 20000) invalid('text must be a string up to 20,000 UTF-16 code units');
-      return textResult(await runDesktop('type_text', { text: args.text }));
+      return textResult(await desktopRunner('type_text', { text: args.text }));
     case 'desktop_hotkey':
       if (!Array.isArray(args.keys) || args.keys.length < 1 || args.keys.length > 5 ||
           args.keys.some((key) => typeof key !== 'string' || key.length < 1 || key.length > 20)) {
         invalid('keys must contain 1 to 5 short key names');
       }
-      return textResult(await runDesktop('hotkey', { keys: args.keys }));
+      return textResult(await desktopRunner('hotkey', { keys: args.keys }));
     case 'desktop_scroll': {
       const ticks = args.ticks;
       if (!Number.isInteger(ticks) || ticks < -20 || ticks > 20 || ticks === 0) invalid('ticks must be a nonzero integer from -20 to 20');
@@ -220,14 +317,75 @@ async function callTool(name, rawArgs) {
         payload.x = coordinate(args.x, 'x');
         payload.y = coordinate(args.y, 'y');
       }
-      return textResult(await runDesktop('scroll', payload));
+      return textResult(await desktopRunner('scroll', payload));
     }
     case 'desktop_top_memory_processes': {
       const limit = args.limit === undefined ? 10 : args.limit;
       if (!Number.isInteger(limit) || limit < 1 || limit > 50) invalid('limit must be from 1 to 50');
       const backgroundOnly = args.backgroundOnly === undefined ? false : args.backgroundOnly;
       if (typeof backgroundOnly !== 'boolean') invalid('backgroundOnly must be boolean');
-      return textResult(await runDesktop('top_memory_processes', { limit, backgroundOnly }));
+      return textResult(await desktopRunner('top_memory_processes', { limit, backgroundOnly }));
+    }
+    case 'desktop_search_files': {
+      const rootPath = args.rootPath === undefined ? '' : args.rootPath;
+      if (typeof rootPath !== 'string' || rootPath.length > 1000) invalid('rootPath must be a path under 1,000 characters');
+      const namePattern = args.namePattern === undefined ? '*' : args.namePattern;
+      if (typeof namePattern !== 'string' || !namePattern.trim() || namePattern.length > 260 || /[\\/]/.test(namePattern)) {
+        invalid('namePattern must be a file name pattern without folder separators');
+      }
+      const limit = args.limit === undefined ? 30 : args.limit;
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) invalid('limit must be from 1 to 100');
+      return textResult(await desktopRunner('search_files', { rootPath, namePattern, limit }));
+    }
+    case 'desktop_get_file_info':
+      if (typeof args.path !== 'string' || !args.path.trim() || args.path.length > 1000) invalid('path must be non-empty and under 1,000 characters');
+      return textResult(await desktopRunner('get_file_info', { path: args.path }));
+    case 'desktop_copy_file':
+    case 'desktop_move_file': {
+      if (typeof args.sourcePath !== 'string' || !args.sourcePath.trim() || args.sourcePath.length > 1000 ||
+          typeof args.destinationPath !== 'string' || !args.destinationPath.trim() || args.destinationPath.length > 1000) {
+        invalid('sourcePath and destinationPath must be non-empty paths under 1,000 characters');
+      }
+      const action = name === 'desktop_copy_file' ? 'copy_file' : 'move_file';
+      return textResult(await desktopRunner(action, { sourcePath: args.sourcePath, destinationPath: args.destinationPath }));
+    }
+    case 'desktop_rename_file':
+      if (typeof args.path !== 'string' || !args.path.trim() || args.path.length > 1000 ||
+          typeof args.newName !== 'string' || !args.newName.trim() || args.newName.length > 260 || /[\\/]/.test(args.newName)) {
+        invalid('path must be a file path and newName must be a single file name');
+      }
+      return textResult(await desktopRunner('rename_file', { path: args.path, newName: args.newName }));
+    case 'desktop_recycle_file': {
+      if (typeof args.path !== 'string' || !args.path.trim() || args.path.length > 1000) invalid('path must be non-empty and under 1,000 characters');
+      const approval = await approvalRequester(`휴지통으로 이동할까요?\n대상: ${args.path}\n영향: 파일 또는 폴더가 휴지통으로 이동합니다. 이 베타에서는 영구 삭제를 할 수 없습니다.`);
+      if (approval?.action !== 'accept') throw new Error('사용자가 작업을 허용하지 않았습니다. 파일은 이동하지 않았습니다.');
+      return textResult(await desktopRunner('recycle_file', { path: args.path }));
+    }
+    case 'desktop_launch_app':
+      if (typeof args.path !== 'string' || !args.path.trim() || args.path.length > 1000 || !/\.exe$/i.test(args.path)) {
+        invalid('path must identify one .exe application file');
+      }
+      return textResult(await desktopRunner('launch_app', { path: args.path }));
+    case 'desktop_focus_window':
+      if (typeof args.handle !== 'string' || !/^0x[0-9a-f]+$/i.test(args.handle)) invalid('handle must be a hexadecimal window handle from desktop_list_windows');
+      return textResult(await desktopRunner('focus_window', { handle: args.handle }));
+    case 'desktop_system_resources':
+      return textResult(await desktopRunner('system_resources'));
+    case 'desktop_list_processes': {
+      const limit = args.limit === undefined ? 30 : args.limit;
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) invalid('limit must be from 1 to 100');
+      const nameContains = args.nameContains === undefined ? '' : args.nameContains;
+      if (typeof nameContains !== 'string' || nameContains.length > 100) invalid('nameContains must be a string under 100 characters');
+      return textResult(await desktopRunner('list_processes', { limit, nameContains }));
+    }
+    case 'desktop_terminate_process': {
+      if (!Number.isSafeInteger(args.processId) || args.processId < 1 || args.processId > 2147483647 ||
+          typeof args.processName !== 'string' || !/^[\w.-]{1,100}$/.test(args.processName)) {
+        invalid('processId and exact processName are required');
+      }
+      const approval = await approvalRequester(`이 프로세스를 종료할까요?\n대상: ${args.processName} (PID ${args.processId})\n영향: 이 프로그램의 현재 작업이 저장되지 않은 상태라면 손실될 수 있습니다.`);
+      if (approval?.action !== 'accept') throw new Error('사용자가 프로세스 종료를 허용하지 않았습니다. 프로세스는 계속 실행 중입니다.');
+      return textResult(await desktopRunner('terminate_process', { processId: args.processId, processName: args.processName }));
     }
     case 'confirm_high_impact':
       if (typeof args.action !== 'string' || !args.action.trim() || args.action.length > 1000 ||
@@ -247,6 +405,15 @@ async function handle(message) {
   }
   const { id, method, params } = message;
   if (id === undefined) return; // MCP notifications do not have responses.
+  if (typeof method !== 'string' && (message.result !== undefined || message.error !== undefined)) {
+    const resolveApproval = pendingElicitations.get(id);
+    if (resolveApproval) {
+      pendingElicitations.delete(id);
+      resolveApproval(message);
+      return;
+    }
+    return;
+  }
   if (typeof method !== 'string') {
     rpcError(id, -32600, 'Invalid Request');
     return;
@@ -256,7 +423,7 @@ async function handle(message) {
       send({ id, result: {
         protocolVersion: typeof params?.protocolVersion === 'string' ? params.protocolVersion : '2025-06-18',
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: 'jarvis_desktop', version: '0.1.0-beta.2' }
+        serverInfo: { name: 'jarvis_desktop', version: '0.1.0-beta.3' }
       } });
       return;
     case 'ping':
@@ -285,20 +452,29 @@ async function handle(message) {
   }
 }
 
-const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-let queue = Promise.resolve();
-lines.on('line', (line) => {
-  if (!line.trim()) return;
-  let message;
-  try {
-    message = JSON.parse(line);
-  } catch {
-    rpcError(null, -32700, 'Parse error');
-    return;
-  }
-  // Desktop input calls must run in order so a click cannot overtake typing.
-  queue = queue.then(() => handle(message)).catch((error) => {
-    process.stderr.write(`[mcp-server] ${error.stack || error}\n`);
-    if (message?.id !== undefined) rpcError(message.id, -32603, 'Internal error');
+if (require.main === module) {
+  const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  let queue = Promise.resolve();
+  lines.on('line', (line) => {
+    if (!line.trim()) return;
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      rpcError(null, -32700, 'Parse error');
+      return;
+    }
+    // Approval replies must be handled while a serialized desktop call is waiting.
+    if (message && typeof message === 'object' && typeof message.method !== 'string' && message.id !== undefined) {
+      void handle(message).catch((error) => process.stderr.write(`[mcp-server] ${error.stack || error}\n`));
+      return;
+    }
+    // Desktop input calls must run in order so a click cannot overtake typing.
+    queue = queue.then(() => handle(message)).catch((error) => {
+      process.stderr.write(`[mcp-server] ${error.stack || error}\n`);
+      if (message?.id !== undefined) rpcError(message.id, -32603, 'Internal error');
+    });
   });
-});
+}
+
+module.exports = { TOOLS, callTool, handle, pendingElicitations, requestUserApproval, runDesktop };

@@ -75,7 +75,7 @@ class CodexClient extends EventEmitter {
     this.process.on('error', (error) => this.fail(error));
     this.process.on('exit', (code) => this.fail(new Error(`Codex App Server 종료 (${code ?? 'unknown'})`)));
     await this.request('initialize', {
-      clientInfo: { name: 'jarvis_desktop', title: 'Jarvis', version: '0.1.0-beta.2' },
+      clientInfo: { name: 'jarvis_desktop', title: 'Jarvis', version: '0.1.0-beta.3' },
       capabilities: { experimentalApi: true }
     }, 15000);
     this.notify('initialized', {});

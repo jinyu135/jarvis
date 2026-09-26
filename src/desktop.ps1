@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('screenshot', 'list_windows', 'click', 'type_text', 'hotkey', 'scroll', 'top_memory_processes')]
+    [ValidateSet('screenshot', 'list_windows', 'click', 'type_text', 'hotkey', 'scroll', 'top_memory_processes', 'search_files', 'get_file_info', 'copy_file', 'move_file', 'rename_file', 'recycle_file', 'launch_app', 'focus_window', 'system_resources', 'list_processes', 'terminate_process')]
     [string]$Action,
 
     [string]$Payload = ''
@@ -89,6 +89,35 @@ public static class DesktopBridge
         public bool isForeground { get; set; }
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeFileTime
+    {
+        public uint low;
+        public uint high;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MemoryStatus
+    {
+        public uint length;
+        public uint load;
+        public ulong totalPhysical;
+        public ulong availablePhysical;
+        public ulong totalPageFile;
+        public ulong availablePageFile;
+        public ulong totalVirtual;
+        public ulong availableVirtual;
+        public ulong availableExtendedVirtual;
+    }
+
+    public sealed class ResourceInfo
+    {
+        public double? cpuLoadPercent { get; set; }
+        public long memoryTotalBytes { get; set; }
+        public long memoryFreeBytes { get; set; }
+        public double memoryUsedPercent { get; set; }
+    }
+
     private delegate bool EnumWindowsCallback(IntPtr handle, IntPtr parameter);
 
     [DllImport("user32.dll", SetLastError = true)]
@@ -114,6 +143,21 @@ public static class DesktopBridge
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindow(IntPtr handle);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr handle, int command);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr handle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetSystemTimes(out NativeFileTime idle, out NativeFileTime kernel, out NativeFileTime user);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GlobalMemoryStatusEx(ref MemoryStatus status);
 
     private static void Submit(INPUT input)
     {
@@ -291,6 +335,47 @@ public static class DesktopBridge
         }, IntPtr.Zero);
         return windows.ToArray();
     }
+
+    public static bool FocusWindow(long rawHandle)
+    {
+        IntPtr handle = new IntPtr(rawHandle);
+        if (!IsWindow(handle)) throw new ArgumentException("The window handle is no longer valid");
+        ShowWindow(handle, 9); // SW_RESTORE
+        if (!SetForegroundWindow(handle))
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Windows did not allow that window to become foreground");
+        return true;
+    }
+
+    private static ulong FileTimeValue(NativeFileTime time)
+    {
+        return ((ulong)time.high << 32) | time.low;
+    }
+
+    public static double? MeasureCpuLoad()
+    {
+        NativeFileTime idleBefore, kernelBefore, userBefore;
+        NativeFileTime idleAfter, kernelAfter, userAfter;
+        if (!GetSystemTimes(out idleBefore, out kernelBefore, out userBefore)) return null;
+        Thread.Sleep(300);
+        if (!GetSystemTimes(out idleAfter, out kernelAfter, out userAfter)) return null;
+        ulong idleDelta = FileTimeValue(idleAfter) - FileTimeValue(idleBefore);
+        ulong totalDelta = FileTimeValue(kernelAfter) - FileTimeValue(kernelBefore) + FileTimeValue(userAfter) - FileTimeValue(userBefore);
+        if (totalDelta == 0) return null;
+        double load = 100.0 * (1.0 - (double)idleDelta / totalDelta);
+        return Math.Round(Math.Max(0.0, Math.Min(100.0, load)), 1);
+    }
+
+    public static ResourceInfo ReadMemory()
+    {
+        MemoryStatus status = new MemoryStatus();
+        status.length = (uint)Marshal.SizeOf(typeof(MemoryStatus));
+        if (!GlobalMemoryStatusEx(ref status)) throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not read Windows memory status");
+        return new ResourceInfo {
+            memoryTotalBytes = (long)status.totalPhysical,
+            memoryFreeBytes = (long)status.availablePhysical,
+            memoryUsedPercent = Math.Round(100.0 * (status.totalPhysical - status.availablePhysical) / status.totalPhysical, 1)
+        };
+    }
 }
 '@
 
@@ -367,6 +452,136 @@ public static class DesktopBridge
                 } | Sort-Object -Property workingSetBytes -Descending | Select-Object -First ([int]$request.limit)
             )
             $result = @{ processes = $processes; count = $processes.Count; backgroundOnly = [bool]$request.backgroundOnly }
+        }
+        'search_files' {
+            $rootPath = [string]$request.rootPath
+            if ([string]::IsNullOrWhiteSpace($rootPath)) { $rootPath = $env:USERPROFILE }
+            $root = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($rootPath))
+            if (-not (Test-Path -LiteralPath $root -PathType Container)) { throw 'Search folder does not exist.' }
+            $volumeRoot = [IO.Path]::GetPathRoot($root)
+            if ($root.TrimEnd('\') -eq $volumeRoot.TrimEnd('\')) { throw 'Searching a whole drive is disabled. Choose a specific folder.' }
+            $pattern = [string]$request.namePattern
+            if ([string]::IsNullOrWhiteSpace($pattern)) { $pattern = '*' }
+            if ($pattern -match '[\\/]') { throw 'Search pattern must be a file name, not a path.' }
+            $limit = [Math]::Max(1, [Math]::Min(100, [int]$request.limit))
+            $pending = [System.Collections.Generic.Stack[string]]::new()
+            $pending.Push($root)
+            $found = [System.Collections.Generic.List[object]]::new()
+            $scanned = 0
+            $maxScanned = 50000
+            while ($pending.Count -gt 0 -and $found.Count -lt $limit -and $scanned -lt $maxScanned) {
+                $folder = $pending.Pop()
+                try { $entries = @(Get-ChildItem -LiteralPath $folder -Force -ErrorAction Stop) }
+                catch { if ($folder -eq $root) { throw }; continue }
+                foreach ($entry in $entries) {
+                    $scanned++
+                    if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                    if ($entry.PSIsContainer) {
+                        $pending.Push($entry.FullName)
+                        continue
+                    }
+                    if ($entry.Name -like $pattern) {
+                        $found.Add([pscustomobject]@{
+                            path = $entry.FullName
+                            name = $entry.Name
+                            extension = $entry.Extension
+                            sizeBytes = [long]$entry.Length
+                            modifiedAt = $entry.LastWriteTimeUtc.ToString('o')
+                        })
+                        if ($found.Count -ge $limit) { break }
+                    }
+                    if ($scanned -ge $maxScanned) { break }
+                }
+            }
+            $result = @{ rootPath = $root; files = @($found); count = $found.Count; scannedEntries = $scanned; partial = ($pending.Count -gt 0 -or $scanned -ge $maxScanned) }
+        }
+        'get_file_info' {
+            $target = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables([string]$request.path))
+            $item = Get-Item -LiteralPath $target -Force -ErrorAction Stop
+            $size = if ($item.PSIsContainer) { $null } else { [long]$item.Length }
+            $result = @{ path = $item.FullName; name = $item.Name; isDirectory = [bool]$item.PSIsContainer; sizeBytes = $size; extension = $item.Extension; modifiedAt = $item.LastWriteTimeUtc.ToString('o'); attributes = [string]$item.Attributes }
+        }
+        'copy_file' {
+            $source = Get-Item -LiteralPath ([IO.Path]::GetFullPath([string]$request.sourcePath)) -Force -ErrorAction Stop
+            if ($source.PSIsContainer -or (($source.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Only regular files can be copied.' }
+            $destination = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables([string]$request.destinationPath))
+            $parent = [IO.Path]::GetDirectoryName($destination)
+            if (-not (Test-Path -LiteralPath $parent -PathType Container)) { throw 'Destination folder does not exist.' }
+            if (Test-Path -LiteralPath $destination) { throw 'Destination already exists. Overwriting is disabled.' }
+            [IO.File]::Copy($source.FullName, $destination, $false)
+            $result = @{ copied = $true; sourcePath = $source.FullName; destinationPath = $destination; sizeBytes = [long]$source.Length }
+        }
+        'move_file' {
+            $source = Get-Item -LiteralPath ([IO.Path]::GetFullPath([string]$request.sourcePath)) -Force -ErrorAction Stop
+            if ($source.PSIsContainer -or (($source.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Only regular files can be moved.' }
+            $destination = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables([string]$request.destinationPath))
+            $parent = [IO.Path]::GetDirectoryName($destination)
+            if (-not (Test-Path -LiteralPath $parent -PathType Container)) { throw 'Destination folder does not exist.' }
+            if (Test-Path -LiteralPath $destination) { throw 'Destination already exists. Overwriting is disabled.' }
+            [IO.File]::Move($source.FullName, $destination)
+            $result = @{ moved = $true; sourcePath = $source.FullName; destinationPath = $destination; sizeBytes = [long]$source.Length }
+        }
+        'rename_file' {
+            $source = Get-Item -LiteralPath ([IO.Path]::GetFullPath([string]$request.path)) -Force -ErrorAction Stop
+            if ($source.PSIsContainer -or (($source.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Only regular files can be renamed.' }
+            $newName = [string]$request.newName
+            if ([string]::IsNullOrWhiteSpace($newName) -or [IO.Path]::GetFileName($newName) -ne $newName -or $newName -match '[\\/:*?"<>|]') { throw 'New name must be a single valid file name.' }
+            $destination = Join-Path -Path $source.DirectoryName -ChildPath $newName
+            if (Test-Path -LiteralPath $destination) { throw 'Destination already exists. Overwriting is disabled.' }
+            [IO.File]::Move($source.FullName, $destination)
+            $result = @{ renamed = $true; oldPath = $source.FullName; newPath = $destination }
+        }
+        'recycle_file' {
+            $target = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables([string]$request.path))
+            $item = Get-Item -LiteralPath $target -Force -ErrorAction Stop
+            Add-Type -AssemblyName Microsoft.VisualBasic
+            $ui = [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs
+            $recycle = [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
+            if ($item.PSIsContainer) {
+                [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($item.FullName, $ui, $recycle)
+            } else {
+                [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($item.FullName, $ui, $recycle)
+            }
+            $result = @{ recycled = $true; path = $item.FullName; permanentDelete = $false }
+        }
+        'launch_app' {
+            $target = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables([string]$request.path))
+            if ([IO.Path]::GetExtension($target) -ne '.exe' -or -not (Test-Path -LiteralPath $target -PathType Leaf)) { throw 'Application executable does not exist.' }
+            $process = Start-Process -FilePath $target -PassThru -ErrorAction Stop
+            $result = @{ launched = $true; path = $target; processId = $process.Id; processName = $process.ProcessName }
+        }
+        'focus_window' {
+            $rawHandle = [Convert]::ToInt64(([string]$request.handle).Substring(2), 16)
+            [void][DesktopBridge]::FocusWindow($rawHandle)
+            $result = @{ focused = $true; handle = [string]$request.handle }
+        }
+        'system_resources' {
+            $memory = [DesktopBridge]::ReadMemory()
+            $drives = @([IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq [IO.DriveType]::Fixed -and $_.IsReady } | ForEach-Object {
+                try { [pscustomobject]@{ name = $_.Name; sizeBytes = [long]$_.TotalSize; freeBytes = [long]$_.AvailableFreeSpace; usedPercent = if ($_.TotalSize) { [math]::Round(100 * ($_.TotalSize - $_.AvailableFreeSpace) / $_.TotalSize, 1) } else { $null } } } catch { }
+            })
+            $result = @{ cpuLoadPercent = [DesktopBridge]::MeasureCpuLoad(); memoryTotalBytes = $memory.memoryTotalBytes; memoryFreeBytes = $memory.memoryFreeBytes; memoryUsedPercent = $memory.memoryUsedPercent; drives = $drives; sampledAt = [DateTime]::UtcNow.ToString('o') }
+        }
+        'list_processes' {
+            $limit = [Math]::Max(1, [Math]::Min(100, [int]$request.limit))
+            $nameContains = [string]$request.nameContains
+            $processes = @(Get-Process | ForEach-Object {
+                try {
+                    if (-not $nameContains -or $_.ProcessName.IndexOf($nameContains, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                        [pscustomobject]@{ processId = $_.Id; name = $_.ProcessName; workingSetBytes = [long]$_.WorkingSet64; privateBytes = [long]$_.PrivateMemorySize64; workingSetMB = [math]::Round($_.WorkingSet64 / 1MB, 1); hasMainWindow = ($_.MainWindowHandle.ToInt64() -ne 0); windowTitle = $_.MainWindowTitle }
+                    }
+                } catch { }
+            } | Sort-Object -Property workingSetBytes -Descending | Select-Object -First $limit)
+            $result = @{ processes = $processes; count = $processes.Count; nameContains = $nameContains }
+        }
+        'terminate_process' {
+            $processId = [int]$request.processId
+            $process = Get-Process -Id $processId -ErrorAction Stop
+            $expectedName = [string]$request.processName
+            if (-not [string]::Equals($process.ProcessName, $expectedName, [StringComparison]::OrdinalIgnoreCase)) { throw 'Process ID now belongs to a different process. Refresh the process list.' }
+            if ($processId -in @(0, 4, $PID) -or $process.ProcessName -in @('System', 'Idle', 'Registry', 'smss', 'csrss', 'wininit', 'services', 'lsass')) { throw 'Windows core and current tool processes are protected.' }
+            Stop-Process -Id $processId -ErrorAction Stop
+            $result = @{ terminated = $true; processId = $processId; processName = $expectedName }
         }
     }
 

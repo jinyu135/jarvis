@@ -37,11 +37,20 @@
       <main class="workspace">
         <section class="conversation" aria-label="Jarvis 대화">
           <div class="section-header">
-            <div>
-              <span class="section-eyebrow">WORKSPACE</span>
-              <h1>대화</h1>
+            <div class="conversation-heading">
+              <div>
+                <span class="section-eyebrow">WORKSPACE</span>
+                <h1>대화</h1>
+              </div>
+              <div class="conversation-actions">
+                <button id="historyButton" class="secondary-button conversation-button" type="button">이전 대화</button>
+                <button id="newConversationButton" class="primary-button conversation-button" type="button">새 대화</button>
+              </div>
             </div>
-            <span id="agentStatus" class="agent-status"><span class="status-light"></span>준비됨</span>
+            <div class="status-actions">
+              <button id="cancelTurnButton" class="cancel-turn-button" type="button" hidden>중단</button>
+              <span id="agentStatus" class="agent-status"><span class="status-light"></span>준비됨</span>
+            </div>
           </div>
 
           <div id="messageScroller" class="message-scroller">
@@ -50,6 +59,7 @@
               <p class="empty-kicker">YOUR DESKTOP, WITH JARVIS</p>
               <h2>무엇을 도와드릴까요?</h2>
               <p>원하는 일을 자연스럽게 말씀해 주세요. Jarvis가 필요한 단계를 살펴보고 진행 상황을 알려드립니다.</p>
+              <p class="install-note">JarvisSetup.exe는 현재 Windows 계정에 설치한 뒤 Jarvis를 엽니다. 별도 설치 마법사는 표시되지 않습니다.</p>
             </div>
             <div id="messageList" class="message-list" role="log" aria-live="polite" aria-relevant="additions text"></div>
           </div>
@@ -125,6 +135,20 @@
         </aside>
       </main>
     </div>
+
+    <dialog id="historyDialog" class="history-dialog" aria-labelledby="historyTitle">
+      <div class="history-dialog-content">
+        <div class="dialog-header">
+          <div><span class="section-eyebrow">CONVERSATIONS</span><h2 id="historyTitle">이전 대화</h2></div>
+          <button id="closeHistory" class="icon-button" type="button" aria-label="이전 대화 닫기">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5 19 19M19 5 5 19" /></svg>
+          </button>
+        </div>
+        <p class="history-description">이 목록은 Codex App Server에 저장된 대화입니다. App Server API는 베타 기능입니다.</p>
+        <div id="historyNotice" class="dialog-notice" role="alert" hidden></div>
+        <div id="historyList" class="history-list"><p class="muted-empty">대화 목록을 불러오는 중…</p></div>
+      </div>
+    </dialog>
 
     <dialog id="settingsDialog" class="settings-dialog" aria-labelledby="settingsTitle">
       <form id="settingsForm" method="dialog">

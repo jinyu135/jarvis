@@ -2,8 +2,9 @@ const api = window.jarvis;
 
 const el = Object.fromEntries([
   'activityToggle', 'agentStatus', 'approvalCount', 'approvalList', 'authButton', 'authDot',
-  'authLabel', 'cancelSettings', 'closeActivity', 'closeSettings', 'composerForm', 'emptyState',
+  'authLabel', 'cancelSettings', 'cancelTurnButton', 'closeActivity', 'closeHistory', 'closeSettings', 'composerForm', 'emptyState',
   'hotkeyInput', 'messageInput', 'messageList', 'messageScroller', 'micButton', 'notice',
+  'historyButton', 'historyDialog', 'historyList', 'historyNotice', 'newConversationButton',
   'questionCount', 'questionList',
   'saveSettings', 'sendButton', 'settingsButton', 'settingsDialog', 'settingsForm', 'settingsNotice',
   'sidePanel', 'taskCount', 'taskList', 'voiceBanner', 'voiceBannerText', 'voiceStatusDetail',
@@ -19,6 +20,9 @@ const state = {
   settings: { hotkey: 'Ctrl+Alt+J', wakeWordEnabled: false, wakeWord: '자비스' },
   status: 'ready',
   voiceStatus: 'idle',
+  threadId: null,
+  conversations: [],
+  lastTurnStatus: null,
 };
 
 const messageNodes = new Map();
@@ -136,11 +140,54 @@ function renderMessages() {
 function renderStatus() {
   const raw = typeof state.status === 'object' ? (state.status?.state ?? state.status?.status) : state.status;
   const status = String(raw ?? 'ready').toLowerCase();
-  const busy = ['working', 'running', 'busy', 'thinking', 'streaming'].includes(status);
+  const busy = ['working', 'running', 'busy', 'thinking', 'streaming', 'stopping'].includes(status);
   const error = ['error', 'failed'].includes(status);
   el.agentStatus.classList.toggle('is-busy', busy);
   el.agentStatus.classList.toggle('is-ready', !busy && !error);
-  el.agentStatus.lastChild.textContent = busy ? '작업 중' : error ? '확인 필요' : '준비됨';
+  el.agentStatus.lastChild.textContent = busy ? (status === 'stopping' ? '중단 중' : '작업 중')
+    : error ? '확인 필요' : state.lastTurnStatus === 'interrupted' ? '중단됨' : '준비됨';
+  renderComposerStatus();
+}
+
+function renderComposerStatus() {
+  const status = String(state.status ?? '').toLowerCase();
+  const busy = ['working', 'running', 'busy', 'thinking', 'streaming', 'stopping'].includes(status);
+  const stopping = status === 'stopping';
+  if (el.sendButton) el.sendButton.disabled = busy || sending;
+  if (el.cancelTurnButton) {
+    el.cancelTurnButton.hidden = !busy;
+    el.cancelTurnButton.disabled = stopping;
+    el.cancelTurnButton.textContent = stopping ? '중단 중…' : '중단';
+  }
+  const signedIn = isSignedIn();
+  if (el.newConversationButton) el.newConversationButton.disabled = busy || !signedIn;
+  if (el.historyButton) el.historyButton.disabled = busy || !signedIn;
+}
+
+function renderConversations() {
+  if (!el.historyList) return;
+  el.historyList.replaceChildren();
+  const conversations = Array.isArray(state.conversations) ? state.conversations : [];
+  if (!conversations.length) {
+    const empty = document.createElement('p');
+    empty.className = 'muted-empty';
+    empty.textContent = '저장된 대화가 없습니다.';
+    el.historyList.append(empty);
+    return;
+  }
+  for (const conversation of conversations) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'history-item';
+    button.disabled = String(conversation.id) === String(state.threadId);
+    const title = document.createElement('strong');
+    title.textContent = String(conversation.title || '대화');
+    const preview = document.createElement('span');
+    preview.textContent = String(conversation.preview || (button.disabled ? '현재 대화' : '이전 대화'));
+    button.append(title, preview);
+    button.addEventListener('click', () => { void openConversation(conversation.id); });
+    el.historyList.append(button);
+  }
 }
 
 function isSignedIn() {
@@ -157,6 +204,7 @@ function renderAuth() {
   el.authLabel.textContent = signedIn ? (name || 'ChatGPT 연결됨') : 'ChatGPT 로그인';
   el.authButton.title = signedIn ? 'ChatGPT 로그아웃' : 'ChatGPT 로그인';
   el.authButton.setAttribute('aria-label', el.authButton.title);
+  renderComposerStatus();
 }
 
 function statusLabel(status) {
@@ -472,9 +520,20 @@ function renderVoice() {
 
 function applySnapshot(snapshot) {
   if (!snapshot || typeof snapshot !== 'object') return;
+  if (snapshot.threadId !== undefined && snapshot.threadId !== state.threadId) {
+    state.threadId = snapshot.threadId;
+    state.tasks = [];
+    state.approvals = [];
+    state.userInputs = [];
+    activeStreamId = null;
+  }
   if (Array.isArray(snapshot.messages)) {
     state.messages = snapshot.messages;
     renderMessages();
+  }
+  if (Array.isArray(snapshot.conversations)) {
+    state.conversations = snapshot.conversations;
+    renderConversations();
   }
   if (Array.isArray(snapshot.tasks)) state.tasks = snapshot.tasks;
   if (Array.isArray(snapshot.approvals)) state.approvals = snapshot.approvals;
@@ -482,6 +541,7 @@ function applySnapshot(snapshot) {
   if (snapshot.auth !== undefined) state.auth = snapshot.auth;
   if (snapshot.settings && typeof snapshot.settings === 'object') state.settings = { ...state.settings, ...snapshot.settings };
   if (snapshot.status !== undefined) state.status = snapshot.status;
+  if (snapshot.lastTurnStatus !== undefined) state.lastTurnStatus = snapshot.lastTurnStatus;
   if (snapshot.voiceStatus !== undefined) state.voiceStatus = snapshot.voiceStatus;
   renderStatus();
   renderAuth();
@@ -678,14 +738,12 @@ async function sendMessage() {
   if (!text || sending) return;
   if (!api?.sendMessage) return showNotice('Jarvis에 연결할 수 없습니다.');
   if (!isSignedIn()) return showNotice('먼저 ChatGPT 계정으로 로그인해 주세요.');
-  if (['working', 'running', 'busy', 'thinking', 'streaming'].includes(String(state.status).toLowerCase())) {
+  if (['working', 'running', 'busy', 'thinking', 'streaming', 'stopping'].includes(String(state.status).toLowerCase())) {
     return showNotice('현재 작업이 끝나면 다음 요청을 보내 주세요.');
   }
   sending = true;
-  el.sendButton.disabled = true;
   el.messageInput.value = '';
   resizeInput();
-  upsertMessage({ id: `local-${Date.now()}`, role: 'user', content: text, createdAt: Date.now() }, { forceScroll: true });
   state.status = 'working';
   renderStatus();
   try {
@@ -696,8 +754,72 @@ async function sendMessage() {
     renderStatus();
   } finally {
     sending = false;
-    el.sendButton.disabled = false;
+    renderComposerStatus();
     el.messageInput.focus();
+  }
+}
+
+async function stopTurn() {
+  if (!api?.stopTurn) return showNotice('현재 요청을 중단할 수 없습니다.');
+  el.cancelTurnButton.disabled = true;
+  state.status = 'stopping';
+  renderStatus();
+  try {
+    const result = await api.stopTurn();
+    if (!result?.stopped) {
+      state.status = 'ready';
+      renderStatus();
+    }
+  } catch (error) {
+    showNotice(error?.message || '요청을 중단하지 못했습니다.');
+  }
+}
+
+async function startNewConversation() {
+  if (!api?.newConversation) return showNotice('새 대화 기능에 연결할 수 없습니다.');
+  el.newConversationButton.disabled = true;
+  try {
+    const snapshot = await api.newConversation();
+    applySnapshot(snapshot);
+    el.messageInput.focus();
+  } catch (error) {
+    showNotice(error?.message || '새 대화를 시작하지 못했습니다.');
+  } finally {
+    renderComposerStatus();
+  }
+}
+
+async function showHistory() {
+  if (!api?.listConversations) return showNotice('대화 목록 기능에 연결할 수 없습니다.');
+  el.historyNotice.hidden = true;
+  el.historyList.replaceChildren();
+  const loading = document.createElement('p');
+  loading.className = 'muted-empty';
+  loading.textContent = '대화 목록을 불러오는 중…';
+  el.historyList.append(loading);
+  el.historyDialog.showModal();
+  try {
+    state.conversations = await api.listConversations();
+    renderConversations();
+  } catch (error) {
+    el.historyNotice.textContent = error?.message || '대화 목록을 불러오지 못했습니다.';
+    el.historyNotice.hidden = false;
+    el.historyList.replaceChildren();
+  }
+}
+
+async function openConversation(threadId) {
+  if (!api?.openConversation) return;
+  for (const button of el.historyList.querySelectorAll('button')) button.disabled = true;
+  try {
+    const snapshot = await api.openConversation(threadId);
+    applySnapshot(snapshot);
+    el.historyDialog.close();
+    el.messageInput.focus();
+  } catch (error) {
+    el.historyNotice.textContent = error?.message || '대화를 열지 못했습니다.';
+    el.historyNotice.hidden = false;
+    renderConversations();
   }
 }
 
@@ -776,6 +898,10 @@ async function toggleAuth() {
 }
 
 el.composerForm.addEventListener('submit', (event) => { event.preventDefault(); void sendMessage(); });
+el.cancelTurnButton.addEventListener('click', () => { void stopTurn(); });
+el.newConversationButton.addEventListener('click', () => { void startNewConversation(); });
+el.historyButton.addEventListener('click', () => { void showHistory(); });
+el.closeHistory.addEventListener('click', () => el.historyDialog.close());
 el.messageInput.addEventListener('input', resizeInput);
 el.messageInput.addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
